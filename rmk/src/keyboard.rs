@@ -1,6 +1,6 @@
 use core::fmt::Debug;
 
-#[cfg(all(feature = "split", feature = "_ble"))]
+#[cfg(all(feature = "_ble", any(feature = "split", feature = "dongle")))]
 use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 #[cfg(feature = "_ble")]
@@ -1666,6 +1666,26 @@ impl<'a> Keyboard<'a> {
         }
     }
 
+    /// True when the key is still down 5s later. A release inside the window is
+    /// pushed back to `unprocessed_events`, so it replays as a short press.
+    #[cfg(all(feature = "_ble", any(feature = "split", feature = "dongle")))]
+    async fn held_for_5s(&mut self) -> bool {
+        match select(
+            embassy_time::Timer::after_millis(5000),
+            self.keyboard_event_subscriber.next_message_pure(),
+        )
+        .await
+        {
+            Either::First(_) => true,
+            Either::Second(e) => {
+                if self.unprocessed_events.push(e).is_err() {
+                    warn!("Unprocessed event queue is full, dropping event");
+                }
+                false
+            }
+        }
+    }
+
     async fn process_user(&mut self, id: u8, event: KeyboardEvent) {
         debug!("Processing user key id: {:?}, event: {:?}", id, event);
 
@@ -1675,32 +1695,21 @@ impl<'a> Keyboard<'a> {
             use crate::ble::profile::BleProfileAction;
             use crate::channel::BLE_PROFILE_CHANNEL;
             if event.pressed {
-                // Clear Peer is processed when pressed
-                if id == NUM_BLE_PROFILE as u8 + 4 {
-                    #[cfg(feature = "split")]
-                    if event.pressed {
-                        // Wait for 5s, if the key is still pressed, clear split peer info
-                        // If there's any other key event received during this period, skip
-                        match select(
-                            embassy_time::Timer::after_millis(5000),
-                            self.keyboard_event_subscriber.next_message_pure(),
-                        )
-                        .await
-                        {
-                            Either::First(_) => {
-                                // Timeout reached, send clear peer message
-                                #[cfg(feature = "split")]
-                                publish_event(ClearPeerEvent);
-                                info!("Clear peer");
-                            }
-                            Either::Second(e) => {
-                                // Received a new key event before timeout, add to unprocessed list
-                                if self.unprocessed_events.push(e).is_err() {
-                                    warn!("Unprocessed event queue is full, dropping event");
-                                }
-                            }
-                        }
-                    }
+                // A 5s hold of the dongle key clears the local dongle bond and goes
+                // seeking, which is how a keyboard moves to a different dongle.
+                #[cfg(feature = "dongle")]
+                if id == NUM_BLE_PROFILE as u8 + 5 && self.held_for_5s().await {
+                    use crate::ble::profile::DONGLE_PROFILE;
+                    info!("Dongle key held: clearing dongle bond, seeking a dongle");
+                    BLE_PROFILE_CHANNEL
+                        .send(BleProfileAction::ClearSlot(DONGLE_PROFILE))
+                        .await;
+                    BLE_PROFILE_CHANNEL.send(BleProfileAction::Switch(DONGLE_PROFILE)).await;
+                }
+                #[cfg(feature = "split")]
+                if id == NUM_BLE_PROFILE as u8 + 4 && self.held_for_5s().await {
+                    publish_event(ClearPeerEvent);
+                    info!("Clear peer");
                 }
             } else {
                 // Other user keys are processed when released.
@@ -1723,6 +1732,16 @@ impl<'a> Keyboard<'a> {
                     // only meaningful when both transports exist in this build.
                     #[cfg(not(feature = "_no_usb"))]
                     crate::state::toggle_preferred().await;
+                }
+                // Short press of the dongle key: switch to the dongle slot. Also runs
+                // after a 5s hold, where it is a no-op (the hold already put the
+                // keyboard on the dongle profile or was an in-place authorization).
+                #[cfg(feature = "dongle")]
+                if id == NUM_BLE_PROFILE as u8 + 5 {
+                    info!("Switch to dongle profile");
+                    BLE_PROFILE_CHANNEL
+                        .send(BleProfileAction::Switch(crate::ble::profile::DONGLE_PROFILE))
+                        .await;
                 }
             }
         }

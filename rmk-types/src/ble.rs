@@ -1,10 +1,7 @@
-//! BLE status types and advertising constants.
+//! BLE status types.
 
 use postcard::experimental::max_size::MaxSize;
 use serde::{Deserialize, Serialize};
-
-/// Company identifier in RMK's manufacturer-specific advertising data.
-pub const RMK_ADV_COMPANY_ID: u16 = 0x5253;
 
 /// BLE state (what the BLE subsystem is currently doing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, MaxSize)]

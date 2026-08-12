@@ -5,7 +5,21 @@ use embassy_usb::{Builder, msos};
 use embedded_io_async::{ErrorType, Read, Write};
 use rmk_types::protocol::rynk::{RYNK_USB_INTERFACE_CLASS, RYNK_USB_INTERFACE_PROTOCOL, RYNK_USB_INTERFACE_SUBCLASS};
 
-use crate::host::rynk::RynkService;
+use super::HostSession;
+
+#[cfg(feature = "rynk")]
+impl HostSession for crate::host::rynk::RynkService<'_> {
+    async fn serve<R: Read, W: Write>(&self, rx: &mut R, tx: &mut W) {
+        self.run_session(rx, tx).await
+    }
+}
+
+#[cfg(feature = "dongle")]
+impl HostSession for crate::dongle::DongleRouter {
+    async fn serve<R: Read, W: Write>(&self, rx: &mut R, tx: &mut W) {
+        self.run_session(rx, tx).await
+    }
+}
 
 #[cfg(feature = "_usb_high_speed")]
 const RYNK_USB_MAX_PACKET_SIZE: usize = 512;
@@ -32,7 +46,9 @@ pub(crate) struct HostUsbWriter<D: Driver<'static>> {
 }
 
 /// Build the Rynk vendor bulk interface and its WinUSB binding.
-pub fn build_host_usb<D: Driver<'static>>(builder: &mut Builder<'static, D>) -> (HostUsbReader<D>, HostUsbWriter<D>) {
+pub(crate) fn build_host_usb<D: Driver<'static>>(
+    builder: &mut Builder<'static, D>,
+) -> (HostUsbReader<D>, HostUsbWriter<D>) {
     builder.msos_descriptor(msos::windows_version::WIN8_1, MSOS_VENDOR_CODE);
     let mut function = builder.function(
         RYNK_USB_INTERFACE_CLASS,
@@ -65,17 +81,17 @@ pub fn build_host_usb<D: Driver<'static>>(builder: &mut Builder<'static, D>) -> 
 }
 
 /// Rynk session loop
-pub async fn run_host_usb<D: Driver<'static>>(
+pub(crate) async fn run_host_usb<D: Driver<'static>, S: HostSession>(
     receiver: &mut HostUsbReader<D>,
     sender: &mut HostUsbWriter<D>,
-    service: &RynkService<'_>,
+    service: &S,
 ) -> ! {
     loop {
         receiver.ep.wait_enabled().await;
         // A bus reset voids any half-consumed packet from the last session.
         receiver.pos = 0;
         receiver.len = 0;
-        service.run_session(receiver, sender).await;
+        service.serve(receiver, sender).await;
     }
 }
 
