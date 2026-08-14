@@ -47,10 +47,19 @@ use crate::{DONGLE_PAIRING_WINDOW_SECS, RawMutex};
 
 /// One keyboard link, and no more: the dongle relays exactly one keyboard.
 const DONGLE_CONNECTIONS_MAX: usize = 1;
-const DONGLE_L2CAP_CHANNELS_MAX: usize = DONGLE_CONNECTIONS_MAX * 4; // Signal + att + smp + hid
+
+/// trouble's `CHANNELS` counts only dynamic L2CAP channels; the fixed ones
+/// (signalling, ATT, SMP) never take a slot. A dongle talks pure GATT over ATT
+/// and opens no CoC, so zero.
+const DONGLE_L2CAP_CHANNELS_MAX: usize = 0;
 
 /// BLE resources sized for the dongle role; owned by [`Dongle::run`].
-type DongleBleResources = HostResources<DefaultPacketPool, DONGLE_CONNECTIONS_MAX, DONGLE_L2CAP_CHANNELS_MAX>;
+///
+/// The trailing `1, 2` are `ADV_SETS` (its default) and `BONDS`. The dongle
+/// keeps one bond, but [`ProfileManager::update_stack_bonds`] prunes only after
+/// a new pairing lands, so adopting a replacement keyboard briefly holds two —
+/// with a single slot, `add_bond` fails and the new bond is lost on reboot.
+type DongleBleResources = HostResources<DefaultPacketPool, DONGLE_CONNECTIONS_MAX, DONGLE_L2CAP_CHANNELS_MAX, 1, 2>;
 
 /// The services discovery keeps: 0x1812 matches both the report service and the
 /// host-protocol HID service (rynk or vial), plus rynk's custom service.
