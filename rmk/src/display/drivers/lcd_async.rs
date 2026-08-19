@@ -43,10 +43,15 @@ use super::super::DisplayDriver;
 /// - `BUF` — framebuffer storage of length `W * H * 2`. Typically `&'static mut [u8; W * H * 2]`.
 /// - `W` / `H` — display resolution in pixels.
 ///
-/// # Lifecycle
+/// The wrapped [`Display`] must already be initialized by [`lcd_async::Builder::init`];
+/// [`DisplayDriver::init`] is a no-op.
 ///
-/// The wrapped [`Display`] must already be initialized by [`lcd_async::Builder::init`]
-/// before being passed to [`new`](Self::new). [`DisplayDriver::init`] is therefore a no-op.
+/// [`flush`](DisplayDriver::flush) sends only the rectangle drawn since the
+/// last flush — gathered into whole transfers via the
+/// [`with_staging`](Self::with_staging) scratch, widened to full rows without
+/// one — and is a no-op when nothing was drawn. To benefit, renderers should
+/// repaint only the widgets whose value changed instead of clearing the whole
+/// screen each frame.
 pub struct LcdAsyncDisplay<DI, MOD, RST, BUF, const W: usize, const H: usize>
 where
     DI: Interface<Word = u8>,
@@ -56,6 +61,10 @@ where
 {
     display: Display<DI, MOD, RST>,
     buffer: BUF,
+    /// Union of the areas drawn since the last flush. `None` = nothing to send.
+    dirty: Option<Rectangle>,
+    /// Scratch for gathering a sub-width rectangle into one contiguous transfer.
+    staging: Option<&'static mut [u8]>,
 }
 
 impl<DI, MOD, RST, BUF, const W: usize, const H: usize> LcdAsyncDisplay<DI, MOD, RST, BUF, W, H>
@@ -74,12 +83,48 @@ where
             W * H * 2,
             "framebuffer length must equal W * H * 2 (Rgb565)",
         );
-        Self { display, buffer }
+        Self {
+            display,
+            buffer,
+            // Everything is stale before the first flush.
+            dirty: Some(Rectangle::new(Point::zero(), Size::new(W as u32, H as u32))),
+            staging: None,
+        }
+    }
+
+    /// Lend scratch for gathering a sub-width dirty rectangle, so it goes out as
+    /// one transfer instead of widening to full rows.
+    ///
+    /// Size it for the widest rectangle a frame will dirty, `width * height * 2`
+    /// bytes, and that rectangle is sent in a single call. A smaller buffer still
+    /// works — the gather runs in as many passes as it takes — down to one row,
+    /// below which the flush widens to full rows instead.
+    pub fn with_staging(mut self, staging: &'static mut [u8]) -> Self {
+        self.staging = Some(staging);
+        self
     }
 
     /// Borrow the underlying [`Display`].
     pub fn display(&mut self) -> &mut Display<DI, MOD, RST> {
         &mut self.display
+    }
+
+    /// Merge `area` (clipped to the screen) into the dirty region.
+    fn mark_dirty(&mut self, area: &Rectangle) {
+        let screen = Rectangle::new(Point::zero(), Size::new(W as u32, H as u32));
+        let area = area.intersection(&screen);
+        let Some(area_br) = area.bottom_right() else {
+            return; // Zero-sized after clipping.
+        };
+        self.dirty = Some(match self.dirty {
+            None => area,
+            // Tracked dirty rects are never zero-sized, so `bottom_right` is
+            // always `Some`; `unwrap_or` just keeps this panic-free.
+            Some(d) => Rectangle::with_corners(
+                d.top_left.component_min(area.top_left),
+                d.bottom_right().unwrap_or(d.top_left).component_max(area_br),
+            ),
+        });
     }
 }
 
@@ -93,10 +138,56 @@ where
     async fn init(&mut self) {}
 
     async fn flush(&mut self) {
-        let _ = self
-            .display
-            .show_raw_data(0, 0, W as u16, H as u16, self.buffer.as_ref())
-            .await;
+        let Some(dirty) = self.dirty else {
+            return;
+        };
+        let x0 = dirty.top_left.x as usize;
+        let y0 = dirty.top_left.y as usize;
+        let w = dirty.size.width as usize;
+        let h = dirty.size.height as usize;
+
+        // A sub-width rectangle is not contiguous in a row-major framebuffer, so
+        // sending one means either a call per row or a copy. A call per row loses:
+        // each carries an address window, several bus transactions and a DMA round
+        // trip for a couple of hundred bytes of payload, and a hundred rows of that
+        // costs more than the columns it set out to save. So gather instead, as
+        // many rows at a time as the scratch holds.
+        match self.staging.as_deref_mut() {
+            Some(staging) if w < W && staging.len() >= w * 2 => {
+                let rows_per_pass = staging.len() / (w * 2);
+                let buffer = self.buffer.as_ref();
+                let mut y = y0;
+                while y < y0 + h {
+                    let count = rows_per_pass.min(y0 + h - y);
+                    for n in 0..count {
+                        let from = ((y + n) * W + x0) * 2;
+                        staging[n * w * 2..(n + 1) * w * 2].copy_from_slice(&buffer[from..from + w * 2]);
+                    }
+                    if self
+                        .display
+                        .show_raw_data(x0 as u16, y as u16, w as u16, count as u16, &staging[..count * w * 2])
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    y += count;
+                }
+            }
+            // Nowhere to gather it: widen to full rows, which are contiguous.
+            _ => {
+                let rows = &self.buffer.as_ref()[y0 * W * 2..(y0 + h) * W * 2];
+                if self
+                    .display
+                    .show_raw_data(0, y0 as u16, W as u16, h as u16, rows)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        self.dirty = None;
     }
 }
 
@@ -126,8 +217,19 @@ where
     where
         I: IntoIterator<Item = Pixel<Rgb565>>,
     {
-        let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
-        fb.draw_iter(pixels).ok();
+        let mut min = Point::new(i32::MAX, i32::MAX);
+        let mut max = Point::new(i32::MIN, i32::MIN);
+        {
+            let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
+            fb.draw_iter(pixels.into_iter().inspect(|Pixel(pos, _)| {
+                min = min.component_min(*pos);
+                max = max.component_max(*pos);
+            }))
+            .ok();
+        }
+        if min.x <= max.x {
+            self.mark_dirty(&Rectangle::with_corners(min, max));
+        }
         Ok(())
     }
 
@@ -135,20 +237,29 @@ where
     where
         I: IntoIterator<Item = Rgb565>,
     {
-        let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
-        fb.fill_contiguous(area, colors).ok();
+        {
+            let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
+            fb.fill_contiguous(area, colors).ok();
+        }
+        self.mark_dirty(area);
         Ok(())
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Rgb565) -> Result<(), Self::Error> {
-        let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
-        fb.fill_solid(area, color).ok();
+        {
+            let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
+            fb.fill_solid(area, color).ok();
+        }
+        self.mark_dirty(area);
         Ok(())
     }
 
     fn clear(&mut self, color: Rgb565) -> Result<(), Self::Error> {
-        let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
-        fb.clear(color).ok();
+        {
+            let mut fb = RawFrameBuf::<Rgb565, _>::new(self.buffer.as_mut(), W, H);
+            fb.clear(color).ok();
+        }
+        self.mark_dirty(&Rectangle::new(Point::zero(), Size::new(W as u32, H as u32)));
         Ok(())
     }
 }
